@@ -503,7 +503,7 @@ class DynamicBundleStabilisation:
             self.bundle.pop(0)
 
         # update the stability center if obj imporves significantly
-        if objective_value < self.best_objective * 0.50:    # 5% improvement
+        if objective_value < self.best_objective * 0.50:    # 50% improvement
             self.stability_center = dict(duals)
             self.best_objective = objective_value
 
