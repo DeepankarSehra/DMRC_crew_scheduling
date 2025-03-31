@@ -9,6 +9,7 @@ from collections import defaultdict
 import random
 import gurobipy as gp 
 from gurobipy import GRB
+import heapq
 
 class Service:
     def __init__(self, attrs):
@@ -87,18 +88,18 @@ def node_legal(service1, service2):
 
     if service1.stepback_train_num == "No Stepback":
         if service2.train_num == service1.train_num:
-            if service1.end_stn == service2.start_stn and 0 <= (service2.start_time - service1.end_time) <= 15:
+            if (service1.end_stn == service2.start_stn) and (service2.start_time >= service1.end_time):
                 return True
         else:
-            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time) and (service2.start_time <= service1.end_time + 120):
+            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time):
                 return True
         
     else:
         if service2.train_num == service1.stepback_train_num:
-            if (service1.end_stn == service2.start_stn) and 0 <= (service2.start_time - service1.end_time) <= 15:
+            if (service1.end_stn == service2.start_stn) and (service2.start_time >= service1.end_time):
                 return True
         else:
-            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time) and (service2.start_time <= service1.end_time + 120):
+            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time):
                 return True
     return False
 
@@ -157,7 +158,7 @@ def generate_paths(outgoing_var, show_paths = False):
     for start_path in outgoing_var[-2]:
         current_path = []
         current_path_decision_vars = []
-        if start_path.x !=1:continue
+        if start_path.x != 1 :continue
         else:
             start, end = extract_nodes(start_path.VarName)
             # current_path.append(start_path.VarName)
@@ -279,28 +280,34 @@ def get_lazy_constraints(bad_paths, bad_paths_decision_vars, service_dict):
 
 def can_append(duty, service):
     ''' Checking if service can be appended to duty or not '''
+    # get the last service in the duty
     last_service = duty[-1]
     
-    start_end_stn_tf = last_service.end_stn == service.start_stn
-    # print(service.start_time, last_service.end_time)
+    # check if the end station of the last service is the as the start station of the current service
+    start_end_stn_tf = last_service.end_stn[:4] == service.start_stn[:4]
+    
+    # check if the start time of the current service is within 15 minutes of the end time of the last service
     start_end_time_tf = 0 <= (service.start_time - last_service.end_time) <= 15
+    # check if the end station of the last service is the same as the start station of the current service after a break
     start_end_stn_tf_after_break = last_service.end_stn[:4] == service.start_stn[:4]
-    start_end_time_within = (service.start_time - last_service.end_time) <= 120
+    # check if the start time of the current service is within 120 minutes of the end time of the last service, used for adding break logic
+    start_end_time_within = 0 <= (service.start_time - last_service.end_time) <= 120
 
+    # stepback train number check
     if last_service.stepback_train_num == "No StepBack":
         start_end_rake_tf = last_service.train_num == service.train_num
     else:
         start_end_rake_tf = last_service.stepback_train_num == service.train_num
     
-    # Check for valid conditions and time limits
-    if start_end_rake_tf and start_end_stn_tf and start_end_time_tf:
-        time_dur = service.end_time - duty[0].start_time
-        cont_time_dur = sum([serv.serv_dur for serv in duty])
-        if cont_time_dur <= 180 and time_dur <= 445:
+    # checking for valid conditions and time limits
+    if start_end_rake_tf and start_end_stn_tf and start_end_time_tf:    # if start end rake & station are same, and times are within limits
+        time_dur = service.end_time - duty[0].start_time                # total duty duration
+        cont_time_dur = sum([serv.serv_dur for serv in duty])           # continuous duty duration
+        if cont_time_dur <= 180 and time_dur <= 445:                    # continuous duty <= 3 hrs, total duty <= 7 hrs 25 mins
             return True
-    elif start_end_time_within and start_end_stn_tf_after_break:
-        time_dur = service.end_time - duty[0].start_time
-        if time_dur <= 445:
+    elif start_end_time_within and start_end_stn_tf_after_break:        # if start end station is same after a break, and times are within limits
+        time_dur = service.end_time - duty[0].start_time                
+        if time_dur <= 445:                                             # total duty <= 7 hrs 25 mins
             return True
     return False
 
@@ -329,7 +336,7 @@ def solve_RMLP(services, duties, threshold=0):
     service_constraints = []
     for service_idx, service in enumerate(services):
         constr = model.addConstr(
-            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty) >= 1,
+            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty) == 1,
             name=f"Service_{service.serv_num}")
         service_constraints.append(constr)
 
@@ -346,10 +353,11 @@ def solve_RMLP(services, duties, threshold=0):
         # dual_values = [constr.Pi for constr in service_constraints] 
         dual_values = {f"Service_{service.serv_num}": constr.Pi for service, constr in zip(services, service_constraints)}
 
-        selected_duties_vars = [v.varName for v in model.getVars() if v.x > threshold]
+        primals = {v.varName: v.x for v in model.getVars()}
+
         selected_duties = [v for v in model.getVars() if v.x > threshold]
         
-        return selected_duties, dual_values, selected_duties_vars, objective.getValue()
+        return selected_duties, dual_values, primals, objective.getValue()
     else:
         print("No optimal solution found.")
         return None, None, None, None
@@ -685,3 +693,275 @@ def better_pricing_problem_solver(graph, duals, prev_paths, epsilon=1e-6):
         
     except nx.NetworkXNoPath:
         return None, 0, graph_copy
+    
+
+def new_duty_with_RCSP(graph, dual_values, service_dict, max_resource):
+    """
+    Finds a new duty (path from -2 to -1) using an RCSP algorithm.
+    
+    Parameters:
+      graph         - The directed graph (NetworkX DiGraph).
+      dual_values   - Dictionary with dual values (e.g., {"service_1": value, ...}).
+      service_dict  - Dictionary mapping service number to Service objects.
+      max_resource  - Maximum allowed resource (e.g., maximum duty duration in minutes).
+      
+    Returns:
+      best_path     - The path (list of nodes) for the new duty.
+      best_cost     - The associated reduced cost.
+      labels        - Dictionary of labels at each node.
+    """
+    # Initialize label at source (-2)
+    labels = {-2: [(-2, 0, 0, [-2])]}  # (current_node, cost, resource, path)
+    queue = [-2]
+    
+    while queue:
+        u = queue.pop(0)
+        for label in labels[u]:
+            current_node, current_cost, current_resource, current_path = label
+            for v in graph.successors(u):
+                # Calculate the transition time from u to v:
+                transition_time = 0
+                if u not in [-2, -1] and v not in [-2, -1]:
+                    # Ensure service u has an end time and service v has a start time.
+                    transition_time = max(0, service_dict[v].start_time - service_dict[u].end_time)
+                # Otherwise, for edges involving source/sink, you may define transition_time as 0.
+                
+                # Calculate the new service duration at v (if v is a service)
+                additional_duration = service_dict[v].serv_dur if v not in [-2, -1] else 0
+                
+                # new_resource = current_resource + transition_time + additional_duration
+                new_resource = current_resource + additional_duration
+                # If new resource exceeds limit, skip
+                if new_resource > max_resource:
+                    continue
+                
+                # Update cost; here we subtract the dual value for node u if applicable.
+                additional_cost = -dual_values.get(f"service_{u}", 0) if u not in [-2] else 0
+                new_cost = current_cost + additional_cost
+                new_path = current_path + [v]
+                new_label = (v, new_cost, new_resource, new_path)
+                
+                # Dominance check at node v
+                dominated = False
+                non_dominated = []
+                for existing in labels.get(v, []):
+                    if existing[1] <= new_cost and existing[2] <= new_resource:
+                        dominated = True
+                        break
+                    if not (new_cost <= existing[1] and new_resource <= existing[2]):
+                        non_dominated.append(existing)
+                if dominated:
+                    continue
+                labels[v] = non_dominated + [new_label]
+                if v not in queue:
+                    queue.append(v)
+                    
+    if -1 in labels:
+        best_label = min(labels[-1], key=lambda x: x[1])
+        return best_label[3], best_label[1], labels
+    else:
+        return None, None, labels
+    
+
+def new_duty_with_RCSP_priority(graph, dual_values, service_dict, max_resource):
+    """
+    Finds a new duty (path from source -2 to sink -1) using a Resource-Constrained
+    Shortest Path (RCSP) algorithm with a priority queue. Uses a simplified label tuple:
+    (cost, current_node, resource, path).
+
+    Parameters:
+      graph         - NetworkX DiGraph.
+      dual_values   - Dictionary of dual values (e.g., {"service_1": value, ...}).
+      service_dict  - Dictionary mapping service numbers to Service objects.
+      max_resource  - Maximum allowed resource (e.g., maximum duty duration in minutes).
+
+    Returns:
+      best_path     - The best path (list of nodes) from source (-2) to sink (-1).
+      best_cost     - The associated cost (reduced cost) of that path.
+      labels        - Dictionary of labels at each node (for debugging).
+    """
+    # Initialize labels dictionary with the source node (-2)
+    labels = { -2: [(0, -2, 0, [-2])] }  # (cost, node, resource, path)
+    
+    # Initialize the priority queue with the source label.
+    heap = [(0, -2, 0, [-2])]  # (cost, node, resource, path)
+
+    while heap:
+        cost, u, current_resource, current_path = heapq.heappop(heap)
+
+        # For each successor of u, try to extend the label.
+        for v in graph.successors(u):
+            # Calculate transition time between service u and v (if both are actual services).
+            transition_time = 0
+            if u not in [-2, -1] and v not in [-2, -1]:
+                transition_time = max(0, service_dict[v].start_time - service_dict[u].end_time)
+            
+            # Additional resource consumption is the service duration at v (if applicable).
+            additional_duration = service_dict[v].serv_dur if v not in [-2, -1] else 0
+            
+            # new_resource = current_resource + transition_time + additional_duration
+            new_resource = current_resource + additional_duration
+            if new_resource > max_resource:
+                continue  # Skip if this extension exceeds the allowed resource
+            
+            # Update cost. Here, we subtract the dual value of the current node (if not source).
+            additional_cost = -dual_values.get(f"service_{u}", 0) if u != -2 else 0
+            new_cost = cost + additional_cost
+            
+            new_path = current_path + [v]
+            new_label = (new_cost, v, new_resource, new_path)
+            
+            # Dominance check at node v: remove labels that dominate or are dominated by new_label.
+            dominated = False
+            non_dominated = []
+            for existing in labels.get(v, []):
+                # existing: (ex_cost, node, ex_resource, path)
+                # If existing label is as good or better in cost and resource, discard new_label.
+                if existing[0] <= new_cost and existing[2] <= new_resource:
+                    dominated = True
+                    break
+                # Otherwise, if new_label dominates existing, skip keeping the existing one.
+                if not (new_cost <= existing[0] and new_resource <= existing[2]):
+                    non_dominated.append(existing)
+            if dominated:
+                continue
+            
+            # Update labels at node v.
+            labels.setdefault(v, [])
+            labels[v] = non_dominated + [new_label]
+            
+            # Push the new label onto the priority queue.
+            heapq.heappush(heap, new_label)
+    
+    # After processing all labels, check for labels that have reached the sink (-1).
+    if -1 in labels:
+        best_label = min(labels[-1], key=lambda x: x[0])
+        best_path = best_label[3]
+        best_cost = best_label[0]
+        return best_path, best_cost, labels
+    else:
+        return None, None, labels
+    
+
+import networkx as nx
+
+# def new_duty_with_bellman_ford_2(graph, dual_values, max_duration=360, service_dict=None):
+#     """
+#     Finds a new duty using NetworkX Bellman-Ford algorithm while ensuring total duty duration <= max_duration.
+
+#     Arguments:
+#         graph - directed graph of services
+#         dual_values - dictionary of dual values for each service (key: "Service_{service_id}")
+#         max_duration - maximum allowed duration for the new duty
+
+#     Returns:
+#         path - list of services in the new duty
+#         length - length of the new duty (shortest path distance)
+#         graph_copy - copy of the graph with adjusted edge weights
+#     """
+#     graph_copy = graph.copy()
+
+#     # Adjust edge weights based on dual values
+#     for u, v in graph_copy.edges():
+#         if u != -2:  # Exclude the source node from dual value mapping
+#             service_idx_u = u
+#             dual_u = dual_values.get(f"Service_{service_idx_u}", 0)  # Default to 0 if not found
+
+#             graph_copy[u][v]['weight'] = -dual_u  # Adjust edge weight by dual value
+
+#     # Bellman-Ford with duration constraint
+#     dist = {node: float('inf') for node in graph_copy}
+#     duration = {node: float('inf') for node in graph_copy}  # Track cumulative duty duration
+#     predecessor = {node: None for node in graph_copy}
+
+#     dist[-2] = 0  # Source node
+#     duration[-2] = 0
+#     time = 0
+
+#     # Relaxation for |V| - 1 iterations
+#     for _ in range(len(graph_copy) - 1):
+#         for u, v, data in graph_copy.edges(data=True):
+#             # weight = data.get("weight", 1)  # Dual-adjusted cost
+#             weight = graph[u][v]["weight"]  # Fallback to default weight if not found
+#             time = service_dict[u].serv_dur if u not in [-2, -1] else 0  # Service duration for u
+
+#             # Relaxation step with duty duration constraint
+#             if dist[u] + weight < dist[v] and time + duration[u] <= max_duration:
+#                 dist[v] = dist[u] + weight
+#                 duration[v] = duration[u] + time
+#                 predecessor[v] = u  # Store path
+
+#     # Reconstruct path from sink (-1) to source (-2)
+#     path = []
+#     current = -1
+#     while current is not None:
+#         path.append(current)
+#         current = predecessor[current]
+#     path.reverse()
+
+#     # Ensure path is valid and meets duration constraint
+#     if duration[-1] > max_duration:
+#         print("No valid duty found within duration constraint.")
+#         return None, None, graph_copy
+
+#     return path, dist[-1], graph_copy
+
+
+def new_duty_with_bellman_ford_2(graph, dual_values, max_duration=360, service_dict=None):
+    """
+    Finds a new duty using NetworkX Bellman-Ford algorithm while ensuring total duty duration <= max_duration.
+
+    Arguments:
+        graph - directed graph of services
+        dual_values - dictionary of dual values for each service (key: "Service_{service_id}")
+        max_duration - maximum allowed duration for the new duty
+
+    Returns:
+        path - list of services in the new duty
+        length - length of the new duty (shortest path distance)
+        graph_copy - copy of the graph with adjusted edge weights
+    """
+    graph_copy = graph.copy()
+
+    # Adjust edge weights based on dual values
+    for u, v in graph_copy.edges():
+        if u != -2:  # Exclude the source node from dual value mapping
+            service_idx_u = u
+            dual_u = dual_values.get(f"Service_{service_idx_u}", 0)  # Default to 0 if not found
+
+            graph_copy[u][v]['weight'] = -dual_u  # Adjust edge weight by dual value
+
+    # Bellman-Ford with duration constraint
+    dist = {node: float('inf') for node in graph_copy}
+    duration = {node: float('inf') for node in graph_copy}  # Track cumulative duty duration
+    predecessor = {node: None for node in graph_copy}
+
+    dist[-2] = 0  # Source node
+    duration[-2] = 0
+
+    # Relaxation for |V| - 1 iterations
+    for _ in range(len(graph_copy) - 1):
+        for u, v, data in graph_copy.edges(data=True):
+            weight = data['weight']  # Dual-adjusted cost
+            time = service_dict[u].serv_dur if u not in [-2, -1] else 0  # Edge duration attribute
+
+            # Relaxation step with duty duration constraint
+            if dist[u] + weight < dist[v] and duration[u] + time <= max_duration:
+                dist[v] = dist[u] + weight
+                duration[v] = duration[u] + time
+                predecessor[v] = u  # Store path
+
+    # Reconstruct path from sink (-1) to source (-2)
+    path = []
+    current = -1
+    while current is not None:
+        path.append(current)
+        current = predecessor[current]
+    path.reverse()
+
+    # Ensure path is valid and meets duration constraint
+    if duration[-1] > max_duration:
+        print("No valid duty found within duration constraint.")
+        return None, None, graph_copy
+
+    return path, dist[-1], graph_copy
