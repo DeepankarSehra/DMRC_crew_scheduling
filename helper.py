@@ -4,11 +4,11 @@ import networkx as nx
 import random
 import matplotlib.pyplot as plt
 import inspect
-import numpy as np
 from collections import defaultdict
-import random
 import gurobipy as gp 
 from gurobipy import GRB
+from collections import defaultdict
+from collections import deque
 
 class Service:
     def __init__(self, attrs):
@@ -27,17 +27,27 @@ class Service:
         self.trip_dur = 0
 
 def hhmm2mins(hhmm):
-    ''' Convert time from HH:MM format to minutes '''
     h, m = map(int, hhmm.split(':'))
     return h*60 + m
 
 def mins2hhmm(mins):
-    ''' Convert time from minutes to HH:MM format '''
     h = mins // 60
     m = mins % 60
     return f"{h:02}:{m:02}"
 
-def fetch_data(filename, partial=False, rakes=10):
+def fetch_data(filename):
+    services = []
+    services_dict = {}
+    with open(filename, 'r') as file:
+        reader = csv.reader(file)
+        next(reader)
+        for row in reader:
+            serv_obj = Service(row)
+            services.append(serv_obj)
+            services_dict[serv_obj.serv_num] = serv_obj
+    return services, services_dict
+
+def fetch_data_by_rake(filename, partial=False, rakes=10):
     ''' Fetch data from the given CSV file '''
     services = []
     services_dict = {}
@@ -56,7 +66,6 @@ def fetch_data(filename, partial=False, rakes=10):
     return services, services_dict
 
 def draw_graph_with_edges(graph, n=50):
-    ''' Draw the first n edges of the given graph '''
     # Create a directed subgraph containing only the first n edges
     subgraph = nx.DiGraph()
     
@@ -65,9 +74,8 @@ def draw_graph_with_edges(graph, n=50):
     for u, v in graph.edges():
         if edge_count >= n:
             break
-        if u != -2 and v != -1:
-            subgraph.add_edge(u, v)
-            edge_count += 1
+        subgraph.add_edge(u, v)
+        edge_count += 1
 
     # Plotting the directed subgraph
     plt.figure(figsize=(8, 8))
@@ -82,38 +90,65 @@ def draw_graph_with_edges(graph, n=50):
     # plt.show()
     plt.savefig(f'first{n}edges.png')
 
+## checking if two services can be connected
 def node_legal(service1, service2):
-    ''' Check if two services can be connected '''
-
     if service1.stepback_train_num == "No Stepback":
         if service2.train_num == service1.train_num:
             if service1.end_stn == service2.start_stn and 0 <= (service2.start_time - service1.end_time) <= 15:
                 return True
         else:
-            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time) and (service2.start_time <= service1.end_time + 120):
+            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time + 30) and (service2.start_time <= service1.end_time + 150):
                 return True
         
     else:
         if service2.train_num == service1.stepback_train_num:
-            if (service1.end_stn == service2.start_stn) and 0 <= (service2.start_time - service1.end_time) <= 15:
+            if (service1.end_stn == service2.start_stn) and (service1.end_time == service2.start_time):
                 return True
         else:
-            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time) and (service2.start_time <= service1.end_time + 120):
+            if (service1.end_stn[:4] == service2.start_stn[:4]) and (service2.start_time >= service1.end_time + 30 ) and (service2.start_time <= service1.end_time + 150):
                 return True
     return False
 
 def no_overlap(service1, service2):
-    ''' Check if two services overlap in time '''
     return service1.end_time <= service2.start_time
 
-def create_duty_graph(services):
-    ''' 
-        Creates a directed graph of services, with source and sink nodes at -2, -1 respectively
-
-        Arguments: services - list of Service objects
-
-        Returns: a directed graph G
+def count_overlaps(selected_duties, services):
     '''
+    Checks the number of overlaps of services in selected_duties, and prints them
+
+    Arguments: selected_duties - duties that are selected after column generation
+               services - all services
+
+    Returns: Boolean - False, if number of services != all services covered in selected_duties; else True
+    '''
+    services_covered = {}
+
+    for service in services:
+        services_covered[service.serv_num] = 0
+
+    for duty in selected_duties:
+        for service in duty:
+            services_covered[service] += 1
+
+    num_overlaps = 0
+    num_services = 0
+    for service in services_covered:
+        if services_covered[service] > 1:
+            num_overlaps += 1
+        if services_covered[service] != 0:
+            num_services += 1
+
+    print(f"Number of duties selected: {len(selected_duties)}")
+    print(f"Total number of services: {len(services)}")
+    print(f"Number of services that overlap in duties: {num_overlaps}")
+    print(f"Number of services covered in duties: {num_services}")
+
+    if len(services) != num_services:
+        return False
+    else:
+        return True
+
+def create_duty_graph(services):
     G = nx.DiGraph()
 
     for i, service1 in enumerate(services):
@@ -127,6 +162,7 @@ def create_duty_graph(services):
             if i != j:
                 if node_legal(service1, service2):
                     G.add_edge(service1.serv_num, service2.serv_num, weight=service1.serv_dur)
+
 
     #end node edges
     for i, service in enumerate(services):
@@ -182,10 +218,7 @@ def generate_paths(outgoing_var, show_paths = False):
                 print(current_path)
     return paths, paths_decision_vars
 
-def solution_verify(services, duties):
-    ''' 
-    Checks if all services are assigned to a duty 
-    '''
+def solution_verify(services, duties, verbose =True):
     flag = True
     for service in services:
         service_check = False
@@ -194,7 +227,8 @@ def solution_verify(services, duties):
                 service_check = True
                 break
         if service_check == False:
-            print(f"Service {service.serv_num} not assigned to any duty")
+            if verbose:
+                print(f"Service {service.serv_num} not assigned to any duty")
             flag= False
             break
     return flag
@@ -277,417 +311,667 @@ def get_lazy_constraints(bad_paths, bad_paths_decision_vars, service_dict):
 
     return lazy_constraints
 
+
+
+### Helpers for column generation
 def can_append(duty, service):
-    ''' Checking if service can be appended to duty or not '''
-    # get the last service in the duty
     last_service = duty[-1]
     
-    # check if the end station of the last service is the as the start station of the current service
-    start_end_stn_tf = last_service.end_stn[:4] == service.start_stn[:4]
-    
-    # check if the start time of the current service is within 15 minutes of the end time of the last service
-    start_end_time_tf = 0 <= (service.start_time - last_service.end_time) <= 15
-    # check if the end station of the last service is the same as the start station of the current service after a break
+    start_end_stn_tf = last_service.end_stn == service.start_stn
+    # print(service.start_time, last_service.end_time)
+    start_end_time_tf = 5 <= (service.start_time - last_service.end_time) <= 15
     start_end_stn_tf_after_break = last_service.end_stn[:4] == service.start_stn[:4]
-    # check if the start time of the current service is within 120 minutes of the end time of the last service, used for adding break logic
-    start_end_time_within = 0 <= (service.start_time - last_service.end_time) <= 120
+    start_end_time_within = 50 <= (service.start_time - last_service.end_time) <= 150
 
-    # stepback train number check
     if last_service.stepback_train_num == "No StepBack":
         start_end_rake_tf = last_service.train_num == service.train_num
     else:
         start_end_rake_tf = last_service.stepback_train_num == service.train_num
     
-    # checking for valid conditions and time limits
-    if start_end_rake_tf and start_end_stn_tf and start_end_time_tf:    # if start end rake & station are same, and times are within limits
-        time_dur = service.end_time - duty[0].start_time                # total duty duration
-        cont_time_dur = sum([serv.serv_dur for serv in duty])           # continuous duty duration
-        if cont_time_dur <= 180 and time_dur <= 445:                    # continuous duty <= 3 hrs, total duty <= 7 hrs 25 mins
+    # Check for valid conditions and time limits
+    if start_end_rake_tf and start_end_stn_tf and start_end_time_tf:
+        time_dur = service.end_time - duty[0].start_time
+        cont_time_dur = sum([serv.serv_dur for serv in duty])
+        if cont_time_dur <= 180 and time_dur <= 445:
             return True
-    elif start_end_time_within and start_end_stn_tf_after_break:        # if start end station is same after a break, and times are within limits
-        time_dur = service.end_time - duty[0].start_time                
-        if time_dur <= 445:                                             # total duty <= 7 hrs 25 mins
+    elif start_end_time_within and start_end_stn_tf_after_break:
+        time_dur = service.end_time - duty[0].start_time
+        if time_dur <= 445:
             return True
     return False
 
-def solve_RMLP(services, duties, threshold=0):
-    '''
-    Solves the RMLP 
+def restricted_linear_program(service_dict, duties, show_solutions = False, show_objective = False, warm_start_solution=None, t=0):
 
-    Arguments: services - list of Service objects,
-            duties - list of duties
-    
-    Returns: selected_duties - list of selected duties,
-            dual_values - list of dual values for each service,
-            selected_duties_vars - list of selected duty variables
-            objective_value = objective value of the iteration
-    '''
-    objective = 0
+    # objective = 0
     model = gp.Model("CrewScheduling")
     model.setParam('OutputFlag', 0)
+
     
+    ###Decision Variables
     duty_vars = []
     for i in range(len(duties)):
         duty_vars.append(model.addVar(vtype=GRB.CONTINUOUS, ub=GRB.INFINITY, lb=0, name=f"x{i}"))
 
+    big_penalty = 1e6
+
+
+    ### Objective
     model.setObjective(gp.quicksum(duty_vars), GRB.MINIMIZE)
 
+    
+    ### Constraints
     service_constraints = []
-    for service_idx, service in enumerate(services):
+    for service_idx, service in enumerate(service_dict.values()):
         constr = model.addConstr(
-            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty) >= 1,
+            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty)>= 1,
+            # gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty)== 1,
             name=f"Service_{service.serv_num}")
         service_constraints.append(constr)
 
+    
+
+    ### Warm Start from previous solution
+    # if warm_start_solution:
+    #     for i in warm_start_solution.keys():
+    #         duty_vars[i].VBasis = gp.GRB.BASIC
+    #         duty_vars[i].Start = warm_start_solution[i]
+
+    # for v in model.getVars():
+    #     if v.VBasis == gp.GRB.BASIC:
+    #         # ct+=1
+    #         # basis[int(v.VarNAME[1:])]= v.x
+    #         print(f"Variable '{v.VarName}' is in the basis") 
+
     model.optimize()
 
-    # Step 5: Check the solution and retrieve dual values and selected duties
+
+
     if model.status == GRB.INFEASIBLE:
         print('Infeasible problem!')
+        return None, None, None, None
     elif model.status == GRB.OPTIMAL:
         objective = model.getObjective()
-        # print("Optimal solution found")
+        model.write("model.lp") 
+        if show_solutions:
+            print("Optimal solution found")
         
         # Get the dual variables for each service constraint
-        # dual_values = [constr.Pi for constr in service_constraints] 
-        dual_values = {f"Service_{service.serv_num}": constr.Pi for service, constr in zip(services, service_constraints)}
+        # dual_values = [constr.Pi for constr in service_constraints]
+        duals = dict([(constr.ConstrName, constr.Pi) for constr in service_constraints])
 
-        selected_duties_vars = [v.varName for v in model.getVars() if v.x > threshold]
-        selected_duties = [v for v in model.getVars() if v.x > threshold]
         
-        return selected_duties, dual_values, selected_duties_vars, objective.getValue()
+        solution = [v.x for v in model.getVars()]
+        # print("Hi" ,len(solution))
+        selected_duties = [(v.varName, v.x) for v in model.getVars() if v.x > 0]
+        selected_duties_vars = [v for v in model.getVars() if v.x > 0]
+        
+        ct = 0 
+        basis = {}
+        for v in model.getVars():
+            if v.VBasis == gp.GRB.BASIC:
+                ct+=1
+                basis[int(v.VarNAME[1:])]= v.x
+
+                
+
+        if show_solutions:
+            print("Positive Duties, 0: ", len(selected_duties))
+            for variable in selected_duties_vars:
+                print(variable.varName, variable.x)
+        if show_objective:    
+            print(f"Objective Value: {objective.getValue()}")
+
+        return objective.getValue(), duals, basis, selected_duties, selected_duties_vars
     else:
         print("No optimal solution found.")
-        return None, None, None, None
+        return None, None, None, None, None
 
-def new_duty_with_bellman_ford(graph, dual_values):
+def restricted_linear_program_for_heuristic(service_dict, duties, selected_vars, show_solutions = False, show_objective = False, warm_start_solution=None, t=0):
 
-    '''
-    Finds a new duty using NetworkX Bellman-Ford algorithm
-
-    Arguments: graph - directed graph of services,
-            dual_values - list of dual values for each service
-
-    Returns: path - list of services in the new duty,
-            length - length of the new duty,
-            graph_copy - copy of the graph with adjusted edge weights
-    '''
-    graph_copy = graph.copy()
-    for u, v in graph_copy.edges():
-        if u != -2:
-            service_idx_u = u
-            # dual_u = dual_values[service_idx_u]
-            dual_u = dual_values[f"Service_{service_idx_u}"]
-
-            graph_copy[u][v]['weight'] = -(dual_u)  # Adjust edge weight by dual value
-        # else:
-        #     service_idx_u = -2
-        #     dual_u = dual_values[service_idx_u]
-        #     graph_copy[u][v]['weight'] = -(dual_u)
-    
-
-    path = nx.bellman_ford_path(graph_copy, -2, -1, weight='weight')
-    length = nx.bellman_ford_path_length(graph_copy, -2, -1, weight='weight')
-
-    return path, length, graph_copy
-
-def count_overlaps(selected_duties, services):
-    '''
-    Checks the number of overlaps of services in selected_duties, and prints them
-
-    Arguments: selected_duties - duties that are selected after column generation
-               services - all services
-
-    Returns: Boolean - False, if number of services != all services covered in selected_duties; else True
-    '''
-    services_covered = {}
-
-    for service in services:
-        services_covered[service.serv_num] = 0
-
-    for duty in selected_duties:
-        for service in duty:
-            services_covered[service] += 1
-
-    num_overlaps = 0
-    num_services = 0
-    for service in services_covered:
-        if services_covered[service] > 1:
-            num_overlaps += 1
-        if services_covered[service] != 0:
-            num_services += 1
-
-    print(f"Number of duties selected: {len(selected_duties)}")
-    print(f"Total number of services: {len(services)}")
-    print(f"Number of services that overlap in duties: {num_overlaps}")
-    print(f"Number of services covered in duties: {num_services}")
-
-    if len(services) != num_services:
-        return False
-    else:
-        return True
-    
-def solve_MIP(services, duties, threshold=0, cutoff= 100, mipgap = 0.01, timelimit = 600):
-    '''
-    Solves the RMLP 
-
-    Arguments: services - list of Service objects,
-            duties - list of duties
-    
-    Returns: selected_duties - list of selected duties,
-            dual_values - list of dual values for each service,
-            selected_duties_vars - list of selected duty variables
-            objective_value = objective value of the iteration
-    '''
-    objective = 0
-    model = gp.Model("CrewScheduling_IP")
+    # objective = 0
+    model = gp.Model("CrewScheduling")
     model.setParam('OutputFlag', 0)
+
     
+    ###Decision Variables
+    duty_vars = []
+    for i in range(len(duties)):
+        if i in selected_vars:
+            duty_vars.append(model.addVar(vtype=GRB.CONTINUOUS, ub=1, lb=1, name=f"x{i}"))
+        else:
+            duty_vars.append(model.addVar(vtype=GRB.CONTINUOUS, ub=GRB.INFINITY, lb=0, name=f"x{i}"))
+
+    ### Objective
+    model.setObjective(gp.quicksum(duty_vars), GRB.MINIMIZE)
+
+    ### Constraints
+    service_constraints = []
+    for service_idx, service in enumerate(service_dict.values()):
+        constr = model.addConstr(
+            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty)>= 1,
+            # gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty)== 1,
+            name=f"Service_{service.serv_num}")
+        service_constraints.append(constr)
+
+    ### Warm Start from previous solution
+    # if warm_start_solution:
+    #     for i in warm_start_solution.keys():
+    #         duty_vars[i].VBasis = gp.GRB.BASIC
+    #         duty_vars[i].Start = warm_start_solution[i]
+
+    # for v in model.getVars():
+    #     if v.VBasis == gp.GRB.BASIC:
+    #         # ct+=1
+    #         # basis[int(v.VarNAME[1:])]= v.x
+    #         print(f"Variable '{v.VarName}' is in the basis") 
+
+    model.optimize()
+
+    if model.status == GRB.INFEASIBLE:
+        print('Infeasible problem!')
+        return None, None, None, None
+    elif model.status == GRB.OPTIMAL:
+        objective = model.getObjective()
+        model.write("model.lp") 
+        if show_solutions:
+            print("Optimal solution found")
+        
+        # Get the dual variables for each service constraint
+        # dual_values = [constr.Pi for constr in service_constraints]
+        duals = dict([(constr.ConstrName, constr.Pi) for constr in service_constraints])
+
+        solution = [v.x for v in model.getVars()]
+        # print("Hi" ,len(solution))
+        selected_duties = [(v.varName, v.x) for v in model.getVars() if v.x > 0]
+        selected_duties_vars = [v for v in model.getVars() if v.x > 0]
+        
+        ct = 0 
+        basis = {}
+        for v in model.getVars():
+            if v.VBasis == gp.GRB.BASIC:
+                ct+=1
+                basis[int(v.VarNAME[1:])]= v.x
+
+        if show_solutions:
+            print("Positive Duties, 0: ", len(selected_duties))
+            for variable in selected_duties_vars:
+                print(variable.varName, variable.x)
+        if show_objective:    
+            print(f"Objective Value: {objective.getValue()}")
+
+        return objective.getValue(), duals, basis, selected_duties, selected_duties_vars
+    else:
+        print("No optimal solution found.")
+        return None, None, None, None, None
+
+def generate_initial_feasible_duties_random_from_services(services, num_services, show_duties = False):
+
+    feasible_duties = []
+
+    # initial set of duties should cover all services
+    # not checking for breaks
+    for service1 in services:
+        duty = [service1]
+        for service2 in services:
+            if service1.serv_num != service2.serv_num:
+                if can_append(duty, service2):
+                    duty.append(service2)
+        feasible_duties.append(duty)
+
+    # random_duties = random.sample(feasible_duties, num_services)
+    serv_num_duty = []
+
+    # to get duty in terms of service numbers
+    for duty in feasible_duties:
+        tt = []
+        for serv in duty:
+            tt.append(serv.serv_num)
+        serv_num_duty.append(tt)
+    if show_duties:
+        print(serv_num_duty)
+    return serv_num_duty
+
+
+def generate_new_column(graph, service_dict, dual_values, method = "topological sort", verbose = False):
+    
+
+    if method == "topological sort":
+
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 0
+            else:
+                # graph[u][v]['weight'] = dual_values[u]
+                graph[u][v]['weight'] = dual_values["Service_" + str(u)]
+
+        topo_order = list(nx.topological_sort(graph))
+
+        longest_dist = {node: float('-inf') for node in graph.nodes}
+        longest_dist[-2] = 0  # Distance to source is 0
+        predecessor = {node: None for node in graph.nodes} 
+
+        # Relax edges in topological order
+        for u in topo_order:
+            for v in graph.successors(u):  
+                weight = graph[u][v].get('weight')  
+                if longest_dist[v] < longest_dist[u] + weight:
+                    longest_dist[v] = longest_dist[u] + weight
+                    predecessor[v] = u
+
+        
+        shortest_path = []
+        curr = -1
+
+        while curr is not None:  
+            shortest_path.append(curr)
+            curr = predecessor[curr]
+        # shortest_path.pop()
+        shortest_path.reverse()  
+        # shortest_path.pop()
+
+        if verbose:
+            path_duals = []
+            # path_duals.append(graph[-2][shortest_path[0]]['weight'])
+            for i in range(len(shortest_path)-1):
+                path_duals.append(graph[shortest_path[i]][shortest_path[i+1]]['weight'])
+            # path_duals.append(graph[shortest_path[-1]][-1]['weight'])
+
+            print("Path Duals: ",path_duals)
+
+        return shortest_path[1:-1], longest_dist[-1]
+    
+    elif method == "bellman ford":
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 1
+            else:
+                # graph[u][v]['weight'] = -dual_values[u]
+                graph[u][v]['weight'] = -dual_values["Service_" + str(u)]
+
+        shortest_path = nx.shortest_path(graph, source=-2, target=-1, weight='weight', method = 'bellman-ford')
+        shortest_distance = nx.shortest_path_length(graph, source=-2, target=-1, weight='weight', method = 'bellman-ford')
+
+        if verbose:
+            path_duals = []
+            for i in range(len(shortest_path)-1):
+                path_duals.append(graph[shortest_path[i]][shortest_path[i+1]]['weight'])
+
+            print("Path Duals: ", path_duals)
+
+        return shortest_path[1:-1], shortest_distance
+                        
+
+
+    else:
+        raise NotImplementedError(f"Method {method} not implemented")
+    
+def generate_new_column_2(graph, service_dict, dual_values, method = "topological sort", verbose = False, time_constr = 6*60):
+
+    
+
+    if method == "topological sort":
+
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 0
+            else:
+                # graph[u][v]['weight'] = dual_values[u]
+                graph[u][v]['weight'] = dual_values["Service_" + str(u)]
+
+        topo_order = list(nx.topological_sort(graph))
+
+        longest_dist = {node: float('-inf') for node in graph.nodes}
+        longest_dist[-2] = 0  # Distance to source is 0
+        duration = {node: 0 for node in graph.nodes}
+        predecessor = {node: None for node in graph.nodes} 
+
+        # Relax edges in topological order
+        for u in topo_order:
+            for v in graph.successors(u):  
+                weight = graph[u][v].get('weight')
+                if v!=-1:
+                    succ_dur = service_dict[v].serv_dur
+                else:
+                    succ_dur = 0  
+                if longest_dist[v] < longest_dist[u] + weight and duration[u] + succ_dur <= 6*60:
+                    longest_dist[v] = longest_dist[u] + weight
+                    duration[v] = duration[u] + succ_dur
+                    predecessor[v] = u
+
+        
+        shortest_path = []
+        curr = -1
+
+        while curr is not None:  
+            shortest_path.append(curr)
+            curr = predecessor[curr]
+        # shortest_path.pop()
+        shortest_path.reverse()  
+        # shortest_path.pop()
+
+        if verbose:
+            path_duals = []
+            # path_duals.append(graph[-2][shortest_path[0]]['weight'])
+            for i in range(len(shortest_path)-1):
+                path_duals.append(graph[shortest_path[i]][shortest_path[i+1]]['weight'])
+            # path_duals.append(graph[shortest_path[-1]][-1]['weight'])
+
+            print("Path Duals: ",path_duals)
+
+        return shortest_path[1:-1], longest_dist[-1]
+    # //////////////////////////////////////////////////////////
+    elif method == "bf_duration_constr":
+       # Create a copy of the graph and adjust edge weights based on dual values.
+        graph_copy = graph.copy()
+        # sink_edge_weights = []
+        print("bf_duration_constr")
+        for u, v in graph_copy.edges():
+            # graph_copy[u][-1]['weight'] = 0
+            # service_idx_u = u
+            if u != -2:
+                dual_u = dual_values["Service_" + str(u)]
+                graph_copy[u][v]['weight'] = -(dual_u)
+            # if v == -1:
+            #     sink_edge_weights.append(graph_copy[u][v]['weight'])
+
+        # print("edge weights to sink",sink_edge_weights)
+        
+        # Initialize dictionaries for cost, cumulative duration, and predecessor pointers.
+        nodes = list(graph_copy.nodes())
+        INF = float('inf')
+        cost = {node: INF for node in nodes}
+        duration = {node: INF for node in nodes}
+        pred = {node: None for node in nodes}
+        
+        # The source node (-2) has cost 0 and duration 0.
+        cost[-2] = 0
+        duration[-2] = 0
+        
+        # Perform up to (|V| - 1) relaxations.
+        for _ in range(len(nodes) - 1):
+            updated = False
+            # For each edge, try to relax.
+            for u, v in graph_copy.edges():
+                # If u is reachable...
+                if cost[u] < INF:
+                    # Additional duration for node v: if v is a service node, add its service duration.
+                    add_dur = service_dict[u].serv_dur if u not in [-2, -1] else 0
+                    new_dur = duration[u] + add_dur
+                    # Only relax if the new cumulative duration is within allowed limit.
+                    if new_dur <= time_constr:
+                        new_cost = cost[u] + graph_copy[u][v]['weight']
+                        if new_cost < cost[v]:
+                            cost[v] = new_cost
+                            duration[v] = new_dur
+                            pred[v] = u
+                            updated = True
+            # No updates in this iteration means we can stop early.
+            if not updated:
+                break
+
+        # If the sink (-1) is unreachable within the duration constraint, return None.
+        if cost[-1] == INF:
+            return None, INF
+        # Reconstruct the path from sink (-1) back to source (-2) using predecessor pointers.
+        path = []
+        current = -1
+        while current is not None:
+            path.append(current)
+            current = pred[current]
+        path.reverse()
+        # Remove the source (-2) and sink (-1) from the reconstructed path.
+        if path and path[0] == -2:
+            path = path[1:]
+        if path and path[-1] == -1:
+            path = path[:-1]
+        cost_final = -cost[-1]
+        return path, cost_final
+    elif method == "bellman ford":
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 1
+            else:
+                # graph[u][v]['weight'] = -dual_values[u]
+                graph[u][v]['weight'] = -dual_values["Service_" + str(u)]
+
+        shortest_path = nx.shortest_path(graph, source=-2, target=-1, weight='weight', method = 'bellman-ford')
+        shortest_distance = nx.shortest_path_length(graph, source=-2, target=-1, weight='weight', method = 'bellman-ford')
+
+        if verbose:
+            path_duals = []
+            for i in range(len(shortest_path)-1):
+                path_duals.append(graph[shortest_path[i]][shortest_path[i+1]]['weight'])
+
+            print("Path Duals: ", path_duals)
+
+        return shortest_path[1:-1], shortest_distance
+                        
+
+    elif method == "dp":
+
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 0
+            else:
+                # graph[u][v]['weight'] = dual_values[u]
+                graph[u][v]['weight'] = dual_values["Service_" + str(u)]
+
+        dp_dict = defaultdict(dict)
+
+        topo_order = list(nx.topological_sort(graph))
+        # print(topo_order)
+        # for time in range(time_constr):
+        #     dp_dict[-2][time] = (0, None)
+
+        for node in topo_order:
+            for time in range(time_constr+1):
+                if node == -2:
+                    dp_dict[node][time] = (0, None)
+                else:
+                    best_pred = None
+                    best = 0
+                    for pred in graph.predecessors(node):
+                        # if graph.nodes[pred]["service_time"] > time:
+                        if pred in [-1,-2] :pred_dur = 0 
+                        else: pred_dur = service_dict[pred].serv_dur
+                        if pred_dur > time:
+                            continue
+                        # time_range = max(0, time - graph.nodes[node]["service_time"])
+                        # if node in [-1,-2] :node_dur = 0 
+                        # else: node_dur = service_dict[node].serv_dur
+                        time_range = max(0, time - pred_dur)
+                        for t in range(time_range + 1):
+                            current = dp_dict[pred][t][0] + graph[pred][node]['weight']
+                            # print("Pred: ", pred, ", Time: ", time, ", T: ",t , "Current: ",current, "dp_dict", dp_dict[pred][t])
+                            if current >= best:
+                                best = current
+                                best_pred = pred
+                    dp_dict[node][time] = (best, best_pred)
+        # print(dp_dict[-1])
+
+
+        #extracting path
+        remaining_time = time_constr
+        current = -1
+        spprc = dp_dict[current][remaining_time][0]
+
+        path = deque()
+
+        while current != -2:
+            path.appendleft(current)
+            # print(current, remaining_time)
+            pred = dp_dict[current][remaining_time][1]
+            # remaining_time -= graph.nodes[current]["service_time"]
+            if pred in [-1,-2] :pred_dur = 0 
+            else: pred_dur = service_dict[pred].serv_dur
+            
+            remaining_time -= pred_dur
+            # remaining_time = max(0, remaining_time)
+            current =pred
+            # print("Shortest Path: ", path)  
+
+        print("Shortest Path Length: ", spprc)
+        print("Shortest Path: ", path)
+
+        return list(path)[:-1], spprc
+
+    elif method == "ip":
+        service_dict[-1] = Service([-1,-1, "x", "00:00", "x", "00:00","x",0, "x", "x"])
+        service_dict[-2] = Service([-2,-2, "x", "00:00", "x", "00:00","x",0, "x", "x"])
+
+        for u, v in graph.edges():
+            if u == -2:
+                graph[u][v]['weight'] = 0
+            else:
+                # graph[u][v]['weight'] = dual_values[u]
+                graph[u][v]['weight'] = dual_values["Service_" + str(u)]
+
+        model = gp.Model("SPPRC")
+        model.setParam('OutputFlag', 0) 
+
+        incoming_var = defaultdict(list)
+        outgoing_var = defaultdict(list) 
+        edge_vars = {} #xij - binary
+
+        incoming_adj_list = nx.to_dict_of_lists(graph.reverse())
+
+        #Decision Variables
+        for i,j in graph.edges():
+            edge_vars[i,j] = model.addVar(vtype=GRB.BINARY, name=f"x_{i}_{j}")
+            incoming_var[j].append(edge_vars[i,j])
+            outgoing_var[i].append(edge_vars[i,j])
+            # print(edge_vars)
+            # print("Edge: ", i, " ", j)
+            # model.update()
+            # print(edge_vars[(i,j)].VarName)
+
+        #Objective 
+        model.setObjective(gp.quicksum((edge_vars[i,j]*graph[i][j]['weight']) for i,j in graph.edges()), GRB.MAXIMIZE)
+
+
+        #Constraints - Flow conservation
+        flow_constraints = []
+        for i in graph.nodes():
+            if i == -2:
+                constr = model.addConstr(gp.quicksum(outgoing_var[i]) == 1,name=f"Service_flow_{i}") 
+                flow_constraints.append(constr)
+            elif i == -1:
+                constr = model.addConstr(gp.quicksum(incoming_var[i]) == 1,name=f"Service_flow_{i}") 
+                flow_constraints.append(constr)
+            else:
+                constr = model.addConstr(gp.quicksum(incoming_var[i])== gp.quicksum(outgoing_var[i]),name=f"Service_inflow_{i}") 
+                # constr2 = model.addConstr(gp.quicksum(outgoing_var[i]) ==1, name=f"Service_outflow_{i}")
+
+                flow_constraints.append(constr)
+                # flow_constraints.append(constr2)
+
+
+        
+        #resource constraint 
+        # duration = sum([(edge_vars[i,j].x *service_dict[i].serv_dur) for i,j in graph.edges() if i not in [-1,-2]])
+        # print("Total Duration: ", duration)
+        model.addConstr(gp.quicksum((edge_vars[i,j]*service_dict[i].serv_dur) for i,j in graph.edges() if i !=-1) <= time_constr)
+        
+
+        # model.update()
+        model.write("model_dp.lp")
+        model.optimize()
+
+        if model.status == GRB.INFEASIBLE:
+            print ("Hehe!")
+            print("Model is not feasible")
+        #extracting path
+
+        reduced_cost = 0
+        path = []
+        current = -2
+        path.append(current) 
+        while current != -1:
+            for var in outgoing_var[current]:
+                if var.x ==1:
+                    _ , next = extract_nodes(var.VarName)
+                    reduced_cost += graph[current][next]['weight']
+                    path.append(next)
+                    current = next
+                    break
+
+        del service_dict[-1]
+        del service_dict[-2]
+
+        return path[1:-1], reduced_cost
+        
+    else:
+        raise NotImplementedError(f"Method {method} not implemented")
+    
+# def generate_new_column_3(graph, service_dict, dual_values, method = "dp", verbose = False, time_constr = 6*60):
+
+
+
+def mip(service_dict, duties, show_solutions = True, show_objective = True,warm =140):
+
+
+    model = gp.Model("CrewScheduling")
+    # model.setParam('OutputFlag', 0)
+    model.setParam('TimeLimit', 600)
+
+    
+    ###Decision Variables
     duty_vars = []
     for i in range(len(duties)):
         duty_vars.append(model.addVar(vtype=GRB.BINARY, name=f"x{i}"))
 
+    big_penalty = 1e6
+
+
+    ### Objective
     model.setObjective(gp.quicksum(duty_vars), GRB.MINIMIZE)
 
+    
+    ### Constraints
     service_constraints = []
-    for service_idx, service in enumerate(services):
+    for service_idx, service in enumerate(service_dict.values()):
         constr = model.addConstr(
-            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty) == 1,
+            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty)>= 1,
             name=f"Service_{service.serv_num}")
         service_constraints.append(constr)
 
-    model.setParam('MIPGap', mipgap)
-    model.setParam('TimeLimit', timelimit)
-    model.setParam('MIPFocus', 1)
-    model.setParam('Cutoff', cutoff)
-    model.optimize()
 
-    # Step 5: Check the solution and retrieve dual values and selected duties
-    if model.status == GRB.OPTIMAL or model.status == gp.GRB.TIME_LIMIT:
-        selected_duties = [i for i, var in enumerate(duty_vars) if var.x > 0.5]
-        return model.ObjVal, selected_duties, model
-    else:
-        return None, None, model
+    ##warm start
+    for i in range(warm):
+        duty_vars[i].Start = 1
 
-class DynamicBundleStabilisation:
-    def __init__(self, services, alpha = 0.5, max_bundle_size = 10):
-        self.services = services
-        self.service_indices = {service.serv_num: i for i, service in enumerate(services)}
-        self.alpha = alpha
-        self.max_bundle_size = max_bundle_size
-
-        # initialising bundle
-        self.bundle = []        # list of [dual values, objective values] pairs
-        self.stability_center = None
-        self.best_objective = float('inf')
-
-        # initialise duals to 0
-        self.current_duals = {f"Service_{service.serv_num}": 0 for service in services}
-
-        # proximity parameter for trust region
-        self.mu = 1.0
-
-    def get_stabilised_duals(self, duals, objective_value):
-        """
-        Update the bundle and caluclate stabilised dual values
-        Arguments:
-            duals: dictionary of dual values
-            objective_value: objective value of the current iteration
-        Returns:
-            stabilised_duals: dictionary of stabilised dual values
-        """
-
-        # first call
-        if self.stability_center is None:
-            self.stability_center = dict(duals)
-            self.best_objective = objective_value
-            return duals
-        
-        self.bundle.append((duals, objective_value))
-        if len(self.bundle) > self.max_bundle_size:
-            # remove the oldest element
-            self.bundle.pop(0)
-
-        # update the stability center if obj imporves significantly
-        if objective_value < self.best_objective * 0.50:    # 50% improvement
-            self.stability_center = dict(duals)
-            self.best_objective = objective_value
-
-            # reduce mu to promote exploration
-            self.mu = max(0.2 * self.mu, 0.01)
-        else:
-            # increase for more stability
-            self.mu = min(2 * self.mu, 10)      
-
-        stabilised_duals = self.solve_bundle_subproblem()
-        return stabilised_duals
-    
-    def solve_bundle_subproblem(self):
-        """
-        Solves the bundle subproblem to get stabilised duals
-        Returns:
-            stabilised_duals: dictionary of stabilised dual values
-        """
-
-        if not self.bundle:
-            return self.stability_center
-    
-        model = gp.Model("BundleSubproblem")
-        model.setParam('OutputFlag', 0)
-
-        dual_vars = {}
-        for service in self.services:
-            dual_key = f"Service_{service.serv_num}"
-            dual_vars[dual_key] = model.addVar(vtype = GRB.CONTINUOUS, lb = 0.0, name=dual_key)
-        
-        # auxiliary variable for bundle model
-        v = model.addVar(vtype = GRB.CONTINUOUS, lb = -GRB.INFINITY, name="v")
-
-        # linearisation constraints for the bundle
-        for i, (bundle_dual, bundle_obj) in enumerate(self.bundle):
-            expr = bundle_obj
-            for service in self.services:
-                dual_key = f"Service_{service.serv_num}"
-                if dual_key in bundle_dual:
-                    expr += dual_vars[dual_key] - bundle_dual[dual_key]
-
-            model.addConstr(v >= expr, name=f"cut_{i}")
-        
-        # objective: minimize v + (mu/2) * ||dual_vars - stability_center||^2
-        stability_term = 0
-        for service in self.services:
-            dual_key = f"Service_{service.serv_num}"
-            if dual_key in self.stability_center:
-                diff = dual_vars[dual_key] - self.stability_center[dual_key]
-                stability_term += diff * diff
-
-        model.setObjective(v + (self.mu/2) * stability_term, GRB.MINIMIZE)
-
-        model.optimize()
-
-        if model.status == GRB.OPTIMAL:
-            # return the stabilised duals
-            stabilised_duals = {key: var.x for key, var in dual_vars.items()}
-            return stabilised_duals
-        else:
-            # if not optimized, return the stability center
-            return self.stability_center
-        
-def solve_RMLP_with_bundle(services, duties, bundle_stabiliser, threshold = 0):
-    '''
-    Solves the RMLP with bundle stabilisation
-
-    Arguments: services - list of Service objects,
-            duties - list of duties
-            bundle_stabiliser - object of DynamicBundleStabilisation class
-    
-    Returns: selected_duties - list of selected duties,
-            stabilised_dual_values - dict of stabilised dual values for each service,
-            selected_duties_vars - list of selected duty variables
-            objective_value = objective value of the iteration
-    '''
-    objective = 0
-    model = gp.Model("CrewScheduling")
-    model.setParam('OutputFlag', 0)
-    
-    duty_vars = []
-    for i in range(len(duties)):
-        duty_vars.append(model.addVar(vtype=GRB.CONTINUOUS, ub=GRB.INFINITY, lb=0, name=f"x{i}"))
-
-    model.setObjective(gp.quicksum(duty_vars), GRB.MINIMIZE)
-
-    service_constraints = []
-    for service_idx, service in enumerate(services):
-        constr = model.addConstr(
-            gp.quicksum(duty_vars[duty_idx] for duty_idx, duty in enumerate(duties) if service.serv_num in duty) >= 1,
-            name=f"Service_{service.serv_num}")
-        service_constraints.append(constr)
 
     model.optimize()
 
-    # Step 5: Check the solution and retrieve dual values and selected duties
+
+
     if model.status == GRB.INFEASIBLE:
         print('Infeasible problem!')
         return None, None, None, None
     elif model.status == GRB.OPTIMAL:
         objective = model.getObjective()
+        # model.write("model.lp") 
+        if show_solutions:
+            print("Optimal solution found")
         
         # Get the dual variables for each service constraint
-        dual_values = {f"Service_{service.serv_num}": constr.Pi for service, constr in zip(services, service_constraints)}
+        # dual_values = [constr.Pi for constr in service_constraints]
+        # duals = dict([(constr.ConstrName, constr.Pi) for constr in service_constraints])
 
-        stabilised_dual_values = bundle_stabiliser.get_stabilised_duals(dual_values, objective.getValue())
-
-        selected_duties_vars = [v.varName for v in model.getVars() if v.x > threshold]
-        selected_duties = [v for v in model.getVars() if v.x > threshold]
         
-        return selected_duties, stabilised_dual_values, selected_duties_vars, objective.getValue()
+        solution = [v.x for v in model.getVars()]
+        # print("Hi" ,len(solution))
+        selected_duties = [(v.varName, v.x) for v in model.getVars() if v.x > 0]
+        selected_duties_vars = [v for v in model.getVars() if v.x > 0]
+
+        if show_solutions:
+            print("Positive Duties, 0: ", len(selected_duties))
+            for variable in selected_duties_vars:
+                print(variable.varName, variable.x)
+        if show_objective:    
+            print(f"Objective Value: {objective.getValue()}")
+
+        return objective.getValue(), selected_duties
     else:
         print("No optimal solution found.")
-        return None, None, None, None
-    
-def better_pricing_problem_solver(graph, duals, prev_paths, epsilon=1e-6):
-    '''
-    Finds a new duty using NetworkX Bellman-Ford algorithm while preventing cycling
-
-    Arguments: graph - directed graph of services,
-            dual_values - list of dual values for each service
-            prev_paths - list of previously selected paths
-            epsilon - small value to perturb the edge weights and break ties
-
-    Returns: path - list of services in the new duty
-            cost - reduced cost of the new duty
-            graph_copy - copy of the graph with adjusted edge weights
-    '''
-
-    if prev_paths is None:
-        prev_paths = []
-
-    graph_copy = graph.copy()
-
-    import random
-    random.seed()
-
-    for u, v in graph_copy.edges():
-        base_cost = 1.0
-        if u != -2:
-            dual_u = duals[f"Service_{u}"]
-
-            # calculate reduced cost: base_cost - dual_u
-            perturbation = random.uniform(0, epsilon)
-            reduced_cost = -dual_u + perturbation
-            graph_copy[u][v]['weight'] = reduced_cost
-
-    try:
-        path = nx.bellman_ford_path(graph_copy, -2, -1, weight='weight')
-        reduced_cost = nx.bellman_ford_path_length(graph_copy, -2, -1, weight='weight')
-
-        if path in prev_paths:
-            print("prev path mai hai")
-            for attempt in range(5):  # Try up to 5 times to find new path
-                # Add larger perturbations to edges
-                for u, v in graph_copy.edges():
-                    perturbation = random.uniform(0, 0.01 * (attempt + 1))
-                    graph_copy[u][v]['weight'] += perturbation
-                
-                try:
-                    alt_path = nx.bellman_ford_path(graph_copy, -2, -1, weight='weight')
-                    alt_cost = nx.bellman_ford_path_length(graph_copy, -2, -1, weight='weight')
-
-                    if alt_path not in prev_paths and alt_cost < 0:
-                        return alt_path[1:-1], alt_cost, graph_copy
-                except:
-                    continue
-            
-            # if no better alt path has been found, check if the previous path is still worth adding again
-            if reduced_cost < -0.01:
-                return path[1:-1], reduced_cost, graph_copy
-            else:
-                return None, 0, graph_copy
-            
-        if reduced_cost < 0:
-            return path[1:-1], reduced_cost, graph_copy
-        else:
-            return None, reduced_cost, graph_copy
-        
-    except nx.NetworkXNoPath:
-        return None, 0, graph_copy
+        return None, None
