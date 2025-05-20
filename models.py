@@ -574,6 +574,29 @@ def column_generation2(graph, service_dict, init_column_generator = "random", mp
                     break
                 print("Optimal solution found!")
                 break
+            if pricing_method == "label-setting" and reduced_cost <= 1:
+                print("Cannot find any more columns with negative reduced cost using modified label-setting!")
+                start_time_ip = time.time()
+                duty_1, reduced_cost_1 = generate_new_column_2(graph, service_dict, duals, method = "ip", verbose = verbose)
+                end_time_ip = time.time()
+                if reduced_cost_1 <=1:
+                    print("Optimal solution found!")
+                    break
+                elif duty_1 not in current_duties:
+                    if verbose:
+                        print("Unique Column found!")
+                        print(f"Column Generated through IP in:  {end_time_ip - start_time_ip:.6f} seconds")
+                        print("Generated duty Main:", duty, "Reduced cost Main (shortest path):", reduced_cost)
+                        duty_dur =0 
+                        for serv in duty:
+                            duty_dur += service_dict[serv].serv_dur
+                        print("Duty Duration: ", mins2hhmm(duty_dur))
+                    current_duties.append(duty_1)
+                else:
+                    print("Column from IP already in current duties")
+                    break
+                print("Optimal solution found!")
+                break
             current_duties.append(duty)
             if verbose:
                 print("Current Duties: ", len(current_duties))
@@ -822,6 +845,29 @@ def column_generation4(graph, service_dict, current_duties, selected_vars, prici
                 else:
                     print("Column from IP already in current duties")
                     break
+            if pricing_method == "label-setting" and reduced_cost <= 1:
+                print("Cannot find any more columns with negative reduced cost using label-setting!")
+                start_time_ip = time.time()
+                duty_1, reduced_cost_1 = generate_new_column_2(graph, service_dict, duals, method = "ip", verbose = verbose)
+                end_time_ip = time.time()
+                if reduced_cost_1 <=1:
+                    print("Optimal solution found!")
+                    break
+                elif duty_1 not in current_duties:
+                    if verbose:
+                        print("Unique Column found!")
+                        print(f"Column Generated through IP in:  {end_time_ip - start_time_ip:.6f} seconds")
+                        print("Generated duty Main:", duty, "Reduced cost Main (shortest path):", reduced_cost)
+                        duty_dur =0 
+                        for serv in duty:
+                            duty_dur += service_dict[serv].serv_dur
+                        print("Duty Duration: ", mins2hhmm(duty_dur))
+                    current_duties.append(duty_1)
+                else:
+                    print("Column from IP already in current duties")
+                    break
+                print("Optimal solution found!")
+                break
             current_duties.append(duty)
             if verbose:
                 print("Current Duties: ", len(current_duties))
@@ -851,11 +897,52 @@ def column_generation4(graph, service_dict, current_duties, selected_vars, prici
 
     return current_duties, final_duties, selected_duties, obj, basis
 
-def cg_heuristics(graph, service_dict, current_duties, threshold):
+# def cg_heuristics(graph, service_dict, current_duties, threshold):
+#     selected_vars = []
+    
+#     obj, duals, basis, selected_duties, selected_duties_vars = restricted_linear_program(service_dict, current_duties, show_solutions= False, show_objective = True)
+    
+#     while len(selected_vars) < len(service_dict):
+
+#         if basis == {}:
+#             print("Basis is empty, no more variables to add")
+#             break
+#         added_vars = False
+
+#         for key, value in basis.items():
+#             if value > threshold:
+#                 if key not in selected_vars:
+#                     print("key added in threshold method: ", key, value)
+#                     selected_vars += [key]
+#                     added_vars = True
+        
+#         if not added_vars:      
+#             sorted_basis = dict(sorted(basis.items(), key=lambda item: item[1], reverse=True))
+#             print("sorted basis: ", sorted_basis)
+#             selected_vars += [max((k for k in basis if basis[k] != 1), key=lambda k: basis[k])]
+#             print(selected_vars[-1])
+#             # print(to_add)
+#             print("no more variables to add, choosing the max from basis")
+
+#         negative_duals = 0
+#         for key, value in duals.items():
+#             if value < 0:
+#                 print("ye raha negative dual: ", key, value, "\n")
+#                 negative_duals += 1
+#         print("Number of negative duals: ", negative_duals)
+#         print("Number of selected variables: ", len(selected_vars))
+
+#         current_duties, final_duties, selected_duties, obj, basis = column_generation4(graph, service_dict, selected_vars=selected_vars, current_duties=current_duties, pricing_method = "topological sort", iterations = 1000, verbose = True)
+#         print("Current Objective: ", obj)
+
+#         print("\n=================================================================\n")
+#     return selected_vars, current_duties
+def cg_heuristics(graph, service_dict, pricing_method, current_duties, threshold, n = 1, iterations = 1000, verbose = False):
     selected_vars = []
     
     obj, duals, basis, selected_duties, selected_duties_vars = restricted_linear_program(service_dict, current_duties, show_solutions= False, show_objective = True)
-    
+    i = 0
+
     while len(selected_vars) < len(service_dict):
 
         if basis == {}:
@@ -873,21 +960,31 @@ def cg_heuristics(graph, service_dict, current_duties, threshold):
         if not added_vars:      
             sorted_basis = dict(sorted(basis.items(), key=lambda item: item[1], reverse=True))
             print("sorted basis: ", sorted_basis)
-            selected_vars += [max((k for k in basis if basis[k] != 1), key=lambda k: basis[k])]
-            print(selected_vars[-1])
+            # selected_vars += [max((k for k in basis if basis[k] != 1), key=lambda k: basis[k])]
+            top_n_basis = dict(list(sorted_basis.items())[:n])
+            print(top_n_basis)
+            for key, value in top_n_basis.items():
+                if key not in selected_vars:
+                    print("key added in sorted method: ", key, value)
+                    selected_vars += [key]
+                    added_vars = True
             # print(to_add)
-            print("no more variables to add, choosing the max from basis")
+            print("no more variables to add, choosing the max n from basis")
 
         negative_duals = 0
         for key, value in duals.items():
             if value < 0:
-                print("ye raha negative dual: ", key, value, "\n")
+                # print("ye raha negative dual: ", key, value, "\n")
                 negative_duals += 1
         print("Number of negative duals: ", negative_duals)
         print("Number of selected variables: ", len(selected_vars))
 
-        current_duties, final_duties, selected_duties, obj, basis = column_generation4(graph, service_dict, selected_vars=selected_vars, current_duties=current_duties, pricing_method = "topological sort", iterations = 1000, verbose = True)
+        start_time_1 = time.time()
+        current_duties, final_duties, selected_duties, obj, basis = column_generation4(graph, service_dict, selected_vars=selected_vars, current_duties=current_duties, pricing_method = pricing_method, iterations = iterations, verbose = verbose)
         print("Current Objective: ", obj)
+        end_time_1 = time.time()
+        print(f"Column Generated for iteration {i} in: {end_time_1 - start_time_1:.6f} seconds")
 
         print("\n=================================================================\n")
+        i += 1
     return selected_vars, current_duties

@@ -4,6 +4,7 @@ import networkx as nx
 import random
 import matplotlib.pyplot as plt
 import inspect
+import heapq
 from collections import defaultdict
 import gurobipy as gp 
 from gurobipy import GRB
@@ -217,7 +218,18 @@ def generate_paths(outgoing_var, show_paths = False):
             if show_paths:
                 print(current_path)
     return paths, paths_decision_vars
-
+def reconstruct_path(label):
+            """
+            Reconstruct the full path by backtracking through the 'pred' pointers.
+            Each label is a tuple: (cost, resource_vector, node, pred).
+            Returns the full path as a list of nodes.
+            """
+            path = []
+            while label is not None:
+                cost, resource, node, pred = label
+                path.append(node)
+                label = pred
+            return list(reversed(path))
 def solution_verify(services, duties, verbose =True):
     flag = True
     for service in services:
@@ -726,6 +738,296 @@ def generate_new_column_2(graph, service_dict, dual_values, method = "topologica
             path = path[:-1]
         cost_final = -cost[-1]
         return path, cost_final
+    # ////////////////////////////////////////////////////////////
+    elif method == "label-setting":
+            print("label-setting")
+        # def dominates(lab1, lab2):
+        #     """
+        #     Returns True if lab1 dominates lab2.
+        #     Each label is of the form: (cost, resource_vector, node, pred).
+        #     lab1 dominates lab2 if:
+        #     - lab1.cost <= lab2.cost, and
+        #     - For every index i, lab1.resource_vector[i] <= lab2.resource_vector[i],
+        #         with at least one strict inequality.
+        #     (A safeguard converts an int resource into a one-element tuple.)
+        #     """
+        #     cost1, res1, node1, _ = lab1
+        #     cost2, res2, node2, _ = lab2
+        #     if not isinstance(res1, tuple):
+        #         res1 = (res1,)
+        #     if not isinstance(res2, tuple):
+        #         res2 = (res2,)
+        #     if cost1 > cost2:
+        #         return False
+        #     all_le = all(res1[i] <= res2[i] for i in range(len(res1)))
+        #     any_lt = any(res1[i] < res2[i] for i in range(len(res1)))
+        #     return all_le
+            # return all_le and any_lt
+
+    # def new_duty_rcsp_tent_perm(graph, dual_values, service_dict, max_resource):
+            """
+            RCSP algorithm with multiple vectorial labeling using explicit tentative (L) vs.
+            permanent (P) label management and iterative refinement, as described in Aneja et al. (1983).
+            
+            Each label is represented as:
+                (cost, resource_vector, node, pred)
+            where resource_vector is a tuple (currently (duration,)) and pred is a pointer to the predecessor label.
+            
+            The algorithm:
+            1. Initializes L(source) with (0, (0,), source, None) and sets P(source) = {}.
+            2. Uses a priority queue (heap) to extract the best tentative label (lexicographic order: cost then resource_vector).
+            3. When a label is popped from the heap, if it is still in L(u) it is finalized (moved to P(u)).
+            4. The permanent label is then extended to each successor v, generating new labels that are added to L(v)
+                only if they are not dominated (by either tentative or permanent labels already at v).
+            5. An iterative refinement step is then performed on all nodes: for each node, any label in L(node) that is dominated
+                by any label in P(node) is removed.
+            6. The process continues until the heap is empty.
+            7. At termination, the best label at the sink (node -1) is selected and its path is reconstructed.
+            
+            Parameters:
+            graph         - A NetworkX DiGraph (with designated source = -2 and sink = -1).
+            dual_values   - Dictionary mapping "service_{u}" to dual values.
+            service_dict  - Dictionary mapping service numbers to Service objects (with attributes start_time, end_time, serv_dur).
+            max_resource  - Maximum allowed resource (e.g. maximum duty duration) as a number.
+            
+            Returns:
+            best_path      - The best path (list of nodes) from source (-2) to sink (-1) if one exists.
+            best_cost      - The cost of that path.
+            tentative      - Dictionary of tentative labels per node.
+            permanent      - Dictionary of permanent labels per node.
+            """
+            source = -2
+            sink = -1
+            # //////////////////////////////  extrra check for prunning//////////////////////////////
+            
+            # Enforce tail charging resource values on edges using the "weight" attribute.
+            # For an edge (x, y):
+            # - If x == source, set weight = 0.
+            # - If y == sink, set weight = service_dict[x].serv_dur (if available).
+            # - Otherwise, set weight = service_dict[x].serv_dur.
+            for x, y in list(graph.edges()):
+                if x == source:
+                    graph[x][y]['weight'] = 0
+                elif y == sink:
+                    try:
+                        graph[x][y]['weight'] = service_dict[x].serv_dur
+                    except KeyError:
+                        graph[x][y]['weight'] = 0
+                else:
+                    try:
+                        graph[x][y]['weight'] = service_dict[x].serv_dur
+                    except KeyError:
+                        graph[x][y]['weight'] = 0
+            
+            # Precompute the lower bound on resource from any node to the sink.
+            # Here we use the "weight" attribute for the reversed graph.
+            try:
+                rev_graph = graph.reverse(copy=True)
+                g_comp_res = nx.single_source_dijkstra_path_length(rev_graph, sink, weight="weight")
+            except Exception as e:
+                print("Error computing g_comp_res:", e)
+                g_comp_res = {}
+            # Initialize tentative set at source: store resource as tuple (0,)
+            init_label = (0, (0,), source, None)
+            tentative = {source: [init_label]}
+            permanent = {source: []}
+            
+            # Priority queue (heap) contains tentative labels.
+            heap = [init_label]
+            
+            while heap:
+                # Pop the best tentative label.
+                label = heapq.heappop(heap)  # label: (cost, res_vec, u, pred)
+                cost, res_vec, u, pred = label
+                # If this label is no longer in L(u), skip it.
+                if u not in tentative or label not in tentative[u]:
+                    continue
+                
+                # Finalize the label: remove it from tentative and add to permanent.
+                tentative[u].remove(label)
+                permanent.setdefault(u, []).append(label)
+                
+                # Extend this finalized label to every successor v.
+                for v in graph.successors(u):
+                    # Compute transition time if both u and v are real service nodes.
+                    # trans_time = 0
+                    # if u not in [source, sink] and v not in [source, sink]:
+                    #     trans_time = max(0, service_dict[v].start_time - service_dict[u].end_time)
+                    # Compute additional resource: service duration at v.
+                    # add_dur = service_dict[v].serv_dur if v not in [source, sink] else 0
+                    add_dur = service_dict[u].serv_dur if u not in [source, sink] else 0
+                    new_duration = res_vec[0] +add_dur
+                    # new_duration = res_vec[0] + trans_time + add_dur
+                    # Look-ahead: check that even with an optimistic lower bound from v, total resource doesn't exceed max_resource.
+                    if v in g_comp_res and new_duration + g_comp_res[v] > time_constr:
+                        continue
+
+                    if new_duration > time_constr:
+                        continue  # Skip extension if resource constraint is violated.
+                    new_res_vec = (new_duration,)
+                    
+                    # Update cost: subtract dual value for u if applicable.
+                    if u != source:
+                        # dual_value = dual_values.get(f"service_{u}", 0)
+                        dual_u = dual_values["Service_" + str(u)]
+
+                        add_cost = -(dual_u)
+                    else:
+                        add_cost= 0
+                    new_cost = cost + add_cost
+                    
+                    # Create new label with predecessor pointer.
+                    new_label = (new_cost, new_res_vec, v, label)
+                    
+                    # Dominance check at node v against tentative labels.
+                    dominated = False
+                    non_dominated = []
+                    for lab in tentative.get(v, []):
+                        if (lab[0] <= new_cost and lab[1] <= new_res_vec):
+                            dominated = True
+                            break
+                        if not ((new_cost <= lab[0] and new_res_vec < lab[1])):
+                            non_dominated.append(lab)
+                    if dominated:
+                        continue
+                    # Also check against permanent labels at v.
+                    for lab in permanent.get(v, []):
+                        if (lab[0] < new_cost) or (lab[0] == new_cost and lab[1] <= new_res_vec):
+                            dominated = True
+                            break
+                    if dominated:
+                        continue
+                    
+                    # If not dominated, update tentative set for v.
+                    tentative.setdefault(v, [])
+                    tentative[v] = non_dominated + [new_label]
+                    heapq.heappush(heap, new_label)
+                
+                # # Iterative Refinement: for every node, remove from tentative any label dominated by a permanent label.
+                # for node in list(tentative.keys()):
+                #     refined = []
+                #     for lab in tentative[node]:
+                #         if not any(dominates(perm_lab, lab) for perm_lab in permanent.get(node, [])):
+                #             refined.append(lab)
+                #     tentative[node] = refined
+            
+            # End loop: Gather all labels at sink (both tentative and permanent).
+            sink_labels = tentative.get(sink, []) + permanent.get(sink, [])
+            if sink_labels:
+                best_label = min(sink_labels, key=lambda lab: (lab[0], lab[1]))
+                best_path = reconstruct_path(best_label)
+                # The accumulated dual sum is -best_label[0].
+                best_cost = -(best_label[0]) 
+                # best_cost = best_label[0]
+                # return best_path, best_cost, tentative, permanent
+                # Remove the source (-2) and sink (-1) from the reconstructed path.
+                if best_path and best_path[0] == -2:
+                    best_path = best_path[1:]
+                if best_path and best_path[-1] == -1:
+                    best_path = best_path[:-1]
+                return best_path, best_cost
+            else:
+                return None, None   
+#         import heapq
+
+# # def new_duty_with_RCSP_priority_pred(graph, dual_values, service_dict, max_resource):
+#         """
+#         Finds a new duty (path from source -2 to sink -1) using a Resource-Constrained
+#         Shortest Path (RCSP) algorithm with a priority queue and predecessor pointers.
+        
+#         Instead of storing the full path in each label, each label is stored as a tuple:
+#         (cost, resource, node, pred)
+#         where 'pred' is a pointer to the predecessor label. This is more memory efficient,
+#         and the full path can be reconstructed later via backtracking.
+        
+#         The label tuple is ordered as (cost, resource, node, pred) so that if two labels have 
+#         the same cost, the one with the lower resource consumption is processed first.
+        
+#         Parameters:
+#         graph         - A NetworkX DiGraph.
+#         dual_values   - Dictionary of dual values (e.g., {"service_1": value, ...}).
+#         service_dict  - Dictionary mapping service numbers to Service objects.
+#         max_resource  - Maximum allowed resource (e.g., maximum duty duration in minutes).
+        
+#         Returns:
+#         best_path     - The best path (list of nodes) from source (-2) to sink (-1).
+#         best_cost     - The associated cost (reduced cost) of that path.
+#         labels        - Dictionary of labels at each node (for debugging).
+#         """
+#         # Here, we denote source as -2 and sink as -1.
+#         # Label tuple: (cost, resource, node, pred)
+#         # For the source, pred is None.
+#         labels = { -2: [(0, 0, -2, None)] }
+#         # The heap stores labels. It is ordered lexicographically, so (cost, resource, ...) works as desired.
+#         heap = [(0, 0, -2, None)]
+#         while heap:
+#             cost, resource, u, pred = heapq.heappop(heap)
+#             # Extend the label from node u to every successor v.
+#             for v in graph.successors(u):
+#                 # # Compute transition time only if both u and v are service nodes (not source or sink)
+#                 # transition_time = 0
+#                 # if u not in [-2, -1] and v not in [-2, -1]:
+#                 #     transition_time = max(0, service_dict[v].start_time - service_dict[u].end_time)
+                
+#                 # Additional resource consumption is the service duration at v (if v is a service)
+#                 additional_duration = service_dict[v].serv_dur if v not in [-2, -1] else 0
+#                 # new_resource = resource + transition_time + additional_duration
+#                 new_resource = resource + additional_duration
+#                 if new_resource > time_constr:
+#                     continue  # Skip if resource limit is exceeded
+                
+#                 # Update cost: subtract the dual value for u if u is not the source.
+#                 # if u != -2:
+#                 # service_idx_u = u
+#                 # # dual_u = dual_values[service_idx_u]
+#                 if u != -2:
+#                     dual_u = dual_values["Service_" + str(u)]
+#                 else:
+#                     dual_u = 0
+#                 additional_cost = -(dual_u)
+#                 new_cost = cost + additional_cost
+                
+#                 # Create a new label. Instead of storing the full path, store a pointer (predecessor) to the current label.
+#                 # We set current_label to the label we just popped.
+#                 current_label = (cost, resource, u, pred)
+#                 new_label = (new_cost, new_resource, v, current_label)
+                
+#                 # Dominance check at node v.
+#                 dominated = False
+#                 non_dominated = []
+#                 for existing in labels.get(v, []):
+#                     # Compare by cost and resource.
+#                     if existing[0] <= new_cost and existing[1] <= new_resource:
+#                         dominated = True
+#                         break
+#                     if not (new_cost <= existing[0] and new_resource <= existing[1]):
+#                         non_dominated.append(existing)
+#                 if dominated:
+#                     continue
+                
+#                 # Update labels at node v.
+#                 labels.setdefault(v, [])
+#                 labels[v] = non_dominated + [new_label]
+                
+#                 # Push the new label onto the heap.
+#                 heapq.heappush(heap, new_label)
+        
+#         # Termination: Check if any labels reached the sink (-1)
+#         if -1 in labels and labels[-1]:
+#             best_label = min(labels[-1], key=lambda x: x[0])
+#             best_path = reconstruct_path(best_label)
+#             best_cost = -(best_label[0])
+#             # Remove the source (-2) and sink (-1) from the reconstructed path.
+#             if best_path and best_path[0] == -2:
+#                 best_path = best_path[1:]
+#             if best_path and best_path[-1] == -1:
+#                 best_path = best_path[:-1]
+#             return best_path, best_cost
+#         else:
+#             return None, None
+
+        
+
     elif method == "bellman ford":
         for u, v in graph.edges():
             if u == -2:
